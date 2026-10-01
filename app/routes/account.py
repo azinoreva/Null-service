@@ -44,7 +44,6 @@ async def get_details(
     redis: Redis = Depends(get_redis_client),
 ):
     """Hand back everything signup gave, to a user who already has an account.
-
     Signing in from a second app returns only tokens, so that app never
     learns the user_id, recovery policy, schema version, invitation quota,
     passport signature or the encrypted recovery token. This route closes
@@ -129,3 +128,20 @@ async def forgot_password(
     else:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     
+
+
+class PublicKey(BaseModel):
+    public_key: str = Field(..., min_length= 20, max_length=100)
+
+@router.post("/new-passport")
+async def new_passport(
+    PublicKey: PublicKey,
+    user: dict = Depends(require_jwe_auth),
+    redis: Redis = Depends(get_redis_client)
+):
+    user_id = user['sub']
+    passport = create_passport(user_id, PublicKey.public_key)
+    return {
+        "passport": passport,
+        "expires": 30*24*3600  
+    }
