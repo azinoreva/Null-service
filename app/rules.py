@@ -1,0 +1,26 @@
+"""Rate-limit rules for the routes currently exposed by the API."""
+
+rules = {
+    "/": "600-1_3000-5",
+    "/api/sign-in": "5-1_10-5_20-15",
+    "/api/create-new-user-preprocess": "3-1_5-5_10-30",
+    "/api/create-new-user-postprocess": "5-1_10-5_20-15",
+    "/api/refresh": "10-1_30-5_50-15",
+    "/api/get-details": "10-1_20-5",
+    "/api/forgot_password": "3-1_5-5_10-30",
+    "/api/send_contact": "20-1_60-5",
+    "/api/get_contact": "30-1_100-5",
+    "/api/send_contact_rebound": "20-1_60-5",
+    "/api/drop_contact": "20-1_60-5",
+    "/api/check_contact": "60-1_200-5",
+    "/api/dh-drop": "20-1_60-5",
+    "/api/clear_dh_inbox": "20-1_60-5",
+    "/api/check_dh_drops": "60-1_200-5",
+    "/api/servers": "30-1_100-5",
+    "/api/register-server-pre": "3-1_5-5_10-30",
+    "/api/register-server-post": "5-1_10-5_20-15",
+    "/api/servers/{server_id}/media-url/otp": "3-1_5-5_10-30",
+    "/api/servers/{server_id}/media-url": "5-1_10-5_20-15",
+    "/api/add-servers": "20-1_60-5",
+    "/api/exchange-servers": "20-1_60-5",
+}
