@@ -283,16 +283,16 @@ async def is_allowed(redis,phone_number: str, ip_address: str) -> tuple[bool, st
         pipe.rpush(phone_key, current_time)
         pipe.expire(phone_key, 600)  # Keep key alive for 10 minutes (600s)
         pipe.lrange(phone_key, 0, -1)
-        _, _, phone_requests = pipe.execute()
+        _, _, phone_requests = await pipe.execute()
 
         # Filter out timestamps older than 10 minutes
         valid_phone_requests = [int(t) for t in phone_requests if current_time - int(t) <= 600]
         
         # If the actual list shrank, update it in Redis to clean up memory
         if len(valid_phone_requests) != len(phone_requests):
-            redis.delete(phone_key)
+            await redis.delete(phone_key)
             if valid_phone_requests:
-                redis.rpush(phone_key, *valid_phone_requests)
+                await redis.rpush(phone_key, *valid_phone_requests)
 
         if len(valid_phone_requests) > 3:
             return False, "Too many requests to this phone number. Try again in 10 minutes."
@@ -306,15 +306,15 @@ async def is_allowed(redis,phone_number: str, ip_address: str) -> tuple[bool, st
         pipe.rpush(ip_key, current_time)
         pipe.expire(ip_key, 3600)  # Keep key alive for 1 hour (3600s)
         pipe.lrange(ip_key, 0, -1)
-        _, _, ip_requests = pipe.execute()
+        _, _, ip_requests = await pipe.execute()
 
         # Filter out timestamps older than 1 hour
         valid_ip_requests = [int(t) for t in ip_requests if current_time - int(t) <= 3600]
 
         if len(valid_ip_requests) != len(ip_requests):
-            redis.delete(ip_key)
+            await redis.delete(ip_key)
             if valid_ip_requests:
-                redis.rpush(ip_key, *valid_ip_requests)
+                await redis.rpush(ip_key, *valid_ip_requests)
 
         if len(valid_ip_requests) > 5:
             return False, "Too many requests from this device/network. Try again in an hour."

@@ -3,7 +3,7 @@ import requests
 from firebase_admin import credentials
 from firebase_admin import messaging
 
-from app.log import logger
+from app.utils.logger import logger
 
 
 if not firebase_admin._apps:

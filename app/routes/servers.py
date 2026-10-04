@@ -166,8 +166,9 @@ async def register_server_pre(
     ip = get_client_ip(request)
 
  
-    if not await is_allowed(redis, phone, ip):
-        raise HTTPException(status_code=403, detail="Not allowed")
+    allowed, message = await is_allowed(redis, phone, ip)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=message)
 
     otp = generate_otp()
     await redis.set(f"otp_server:{phone}", otp, ex=OTP_TTL)

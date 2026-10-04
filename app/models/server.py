@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
 from app.models.updates import Categories
 from enum import Enum
@@ -60,6 +60,7 @@ class Server(BaseModel):
 class ServerIn(BaseModel):
     server_url: str = Field(..., max_length=150)
     serverName: str = Field(..., max_length=100)
+    email: EmailStr
     media: Optional[Media] = None
     maxPayload: int = Field(10000, le=100000) # This is the maximum text length allowed for a message going to
     about: str = Field(..., max_length = 500)
