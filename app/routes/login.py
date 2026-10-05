@@ -3,10 +3,15 @@ from app.models.user_model import SignIn
 from app.utils.auth import decrypt_token, issue_session, normalize_phone_number, verify_password
 from pydantic import BaseModel
 from app.utils._redis import get_redis_client
+from app.utils.logger import LoggedAPIRouterMixin
 from redis.asyncio import Redis
 import json
 
-router = APIRouter()
+class LoggedAPIRouter(LoggedAPIRouterMixin, APIRouter):
+    pass
+
+
+router = LoggedAPIRouter()
 
 
 async def account_recovery(blob:str, user_id: str, password: str, redis):

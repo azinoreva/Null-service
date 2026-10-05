@@ -6,10 +6,15 @@ import secrets, string, json
 from app.utils.auth import require_jwe_auth
 from app.utils.config import settings
 from app.utils._redis import get_redis_client
+from app.utils.logger import LoggedAPIRouterMixin
 from redis.asyncio import Redis
 
 
-router = APIRouter()
+class LoggedAPIRouter(LoggedAPIRouterMixin, APIRouter):
+    pass
+
+
+router = LoggedAPIRouter()
 
 # ---- Tunables ---------------------------------------------------------------
 MIN_EXPIRY_SECONDS       = 600            # 10 minutes

@@ -1,5 +1,8 @@
 import asyncio
+import logging
 import re
+import time
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,7 +11,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.utils._redis import init_redis_client, close_redis_client, get_redis_client
 from app.utils.limiter import Limiter
-from app.utils.logger import logger
+from app.utils.logger import log_event, logger, request_id_context, safe_exception
 from app.rules import rules
 from app.routers import api_router
 
@@ -19,6 +22,51 @@ class CustomTimeoutException(Exception):
 
 class CustomPayloadTooLargeException(Exception):
     pass
+
+
+class RequestLoggingMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = uuid4().hex
+        request_token = request_id_context.set(request_id)
+        started = time.perf_counter()
+        status_code = 500
+
+        async def tracking_send(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+                headers = list(message.get("headers", []))
+                headers.append((b"x-request-id", request_id.encode("ascii")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        route = "<unmatched>"
+        try:
+            log_event(logging.INFO, "request.start", method=scope.get("method", "-"))
+            await self.app(scope, receive, tracking_send)
+        except Exception as exc:
+            log_event(logging.ERROR, "request.error", error=safe_exception(exc))
+            raise
+        finally:
+            route_obj = scope.get("route")
+            if route_obj is not None:
+                route = getattr(route_obj, "path", route)
+            log_event(
+                logging.INFO if status_code < 400 else logging.WARNING,
+                "request.complete",
+                method=scope.get("method", "-"),
+                route=route,
+                status_code=status_code,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            )
+            request_id_context.reset(request_token)
 
 
 class RateLimitMiddleware:
@@ -159,6 +207,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"]
     )
+    app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(RateLimitMiddleware, limiter=Limiter(), rules_map=rules)
     app.add_middleware(EnforceJSONMiddleware)
     app.add_middleware(BodySizeLimiter, max_size=20_000, timeout=5)

@@ -10,10 +10,15 @@ from app.utils.auth import require_jwe_auth
 from app.utils.config import settings
 from app.utils._redis import get_redis_client
 from app.utils.limiter import is_allowed, get_client_ip
+from app.utils.logger import LoggedAPIRouterMixin
 from app.models.server import Server, ServerIn  # ServerIn needs a new `email: EmailStr` field
 
 
-router = APIRouter(prefix="", tags=["servers"])
+class LoggedAPIRouter(LoggedAPIRouterMixin, APIRouter):
+    pass
+
+
+router = LoggedAPIRouter(prefix="", tags=["servers"])
 
 OTP_TTL = 300  # 5 minutes
 MAX_OTP_ATTEMPTS = 2

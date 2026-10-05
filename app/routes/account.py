@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from app.utils.logger import LoggedAPIRouterMixin
 from app.models.user_model import ReturnUserCreate, ForgotPassword
 from app.utils._redis import get_redis_client
 from redis.asyncio import Redis
@@ -12,7 +13,11 @@ from enum import Enum
 from app.utils.firebase import send_push
 from typing import Optional
 
-router = APIRouter()
+class LoggedAPIRouter(LoggedAPIRouterMixin, APIRouter):
+    pass
+
+
+router = LoggedAPIRouter()
 
 
 

@@ -9,9 +9,14 @@ from app.utils.auth import create_passport, require_jwe_auth, create_encrypted_t
 from pydantic import BaseModel, Field
 from app.utils.mails_n_sms import send_otp_sms
 from app.utils.limiter import exponential_backoff
+from app.utils.logger import LoggedAPIRouterMixin
 import time
 
-router = APIRouter()
+class LoggedAPIRouter(LoggedAPIRouterMixin, APIRouter):
+    pass
+
+
+router = LoggedAPIRouter()
 
 
 
