@@ -70,9 +70,9 @@ async def create_new_user_postprocess(
     if await redis.hexists("phone_numbers", phone_number):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not allowed")
 
-    check_phone_block = await backoff(redis, phone_number)
-    if check_phone_block:
-        raise HTTPException(status_code=400, detail="Not allowed")
+    # check_phone_block = await backoff(redis, phone_number)
+    # if check_phone_block:
+    #     raise HTTPException(status_code=400, detail="Not allowed")
     
     # Get the pin from Redis
     stored_pin = await redis.get(f"otp_{phone_number}")

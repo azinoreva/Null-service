@@ -53,9 +53,7 @@ class UserAccount(BaseModel):
     phone_number: Optional[str] = Field(None)
     recovery_type: RecoveryPolicy
     salt: str  # Salt used to hash password
-    password: str # Hashed password
-    invitation_count: int
-    last_invitation_reset: Optional[int]  # Timestamp of the last invitation count reset
+    password: str # Hashed password # Timestamp of the last invitation count reset
     push_notification_token: Optional[list]
     date_created: int
     settings_blob: Optional[str]
@@ -69,8 +67,6 @@ class UserAccount(BaseModel):
                 "recovery_type": "standard",
                 "salt": "salt_here",
                 "password": "hashed_password_here",
-                "invitation_count": 0,
-                "last_invitation_reset": 1620000000,
                 "push_notification_token": None,
                 "settings_blob": None,
                 "date_created": 1620000000,

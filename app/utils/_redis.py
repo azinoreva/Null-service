@@ -26,7 +26,7 @@ async def init_redis_client():
         await redis_client.ping()
     except Exception as e:
         await redis_client.close()
-        await redis_client.connections_pool.disconnect()
+        await redis_client.connection_pool.disconnect()
         redis_client = None
         raise RuntimeError(f"Failed to connect to Redis because {e} from url {redis_url}") from e
     
@@ -37,10 +37,18 @@ async def close_redis_client() -> None:
     global redis_client
     if redis_client is not None:
         await redis_client.close()
-        await redis_client.connections_pool.disconnect()
+        await redis_client.connection_pool.disconnect()
         redis_client = None
 
 async def get(key:str) -> Optional[str]:
     return await redis_client.get(key)
+
+
+async def set(key: str, value: str, **kwargs):
+    return await redis_client.set(key, value, **kwargs)
+
+
+async def delete(*keys: str):
+    return await redis_client.delete(*keys)
 
 
