@@ -2,6 +2,8 @@ import os
 import redis.asyncio as aioredis
 from typing import Optional
 
+from app.utils.logger import safe_exception
+
 
 redis_client: Optional[aioredis.Redis] = None
 
@@ -15,20 +17,28 @@ async def init_redis_client():
     if redis_client is not None:
         return redis_client
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-    redis_client = aioredis.from_url(redis_url,
-                                    decode_responses= True,
-                                    socket_timeout= 40,
-                                    max_connections= 1,
-                                    health_check_interval= 10
-                                    )
+    try:
+        max_connections = max(3, int(os.getenv("REDIS_MAX_CONNECTIONS", "20")))
+    except ValueError:
+        max_connections = 20
+
+    redis_client = aioredis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_timeout=40,
+        max_connections=max_connections,
+        health_check_interval=10,
+    )
 
     try:
         await redis_client.ping()
-    except Exception as e:
+    except Exception as exc:
         await redis_client.close()
         await redis_client.connection_pool.disconnect()
         redis_client = None
-        raise RuntimeError(f"Failed to connect to Redis because {e} from url {redis_url}") from e
+        raise RuntimeError(
+            f"Failed to connect to Redis: {safe_exception(exc)}"
+        ) from exc
     
     return redis_client 
 

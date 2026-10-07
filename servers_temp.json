@@ -1,0 +1,23 @@
+{
+  "serverId": "K4m_lsBLJIkT",
+  "serverUrl": "http://127.0.0.1:5000",
+  "serverName": "Test Server",
+  "media": {
+    "url": "https://example.com/image.jpg",
+    "size": 1024,
+    "timer": 10,
+    "media_type": [
+      "image"
+    ]
+  },
+  "maxPayload": 1000,
+  "colour": "#FFFFFF",
+  "about": "This is a test server... Rules are that you should not add rubbish on this server",
+  "categories": [
+    "history", "activism", "community", "social"
+  ],
+  "annotated": false,
+  "disabled": false,
+  "location": null,
+  "serverType": "private"
+}

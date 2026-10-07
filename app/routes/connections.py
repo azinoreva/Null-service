@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 import secrets, string, json
 
 from app.utils.auth import require_jwe_auth
@@ -25,7 +25,9 @@ BRUTE_FORCE_WINDOW       = 3600           # attempt counter resets after 1h
 DH_DROP_EXPIRY_SECONDS   = 60 * 60        # unclaimed dh drops live for 1 hour
 # -----------------------------------------------------------------------------
 
-
+class ServerClass(BaseModel):
+    """servers user is attached to"""
+    server_id: str = Field(..., description="The server id", max_length=20)
 class Contact(BaseModel):
     """A contact to send to another user."""
     nickname: str = Field(..., description="The name of the contact", max_length=50)
@@ -41,6 +43,8 @@ class Contact(BaseModel):
         max_length=128,
     )
     avatar: Optional[str] = Field(None, description="The avatar of the contact", max_length=29000)
+    servers: Optional[List[ServerClass]] = Field(None, description="The servers the contact is attached to")
+    
 
 
 class SendContactRequest(BaseModel):
@@ -136,7 +140,7 @@ async def send_contact(
         ttl = await redis.ttl(_data_key(existing))
         if ttl and ttl > 0:
             return {
-                "url": f"https://null.app/{settings.server_id}/c/{existing}",
+                "url": f"https://null.app/c/{existing}",
                 "expires_in": ttl,
                 "one_time": False,
                 "contact_key": existing
@@ -161,7 +165,7 @@ async def send_contact(
     await pipe.execute()
 
     return {
-        "url": f"https://null.app/{settings.server_id}/c/{key}",
+        "url": f"https://null.app/c/{key}",
         "expires_in": payload.expires_in,
         "one_time": payload.one_time,
         "contact_key": key
@@ -210,8 +214,7 @@ async def send_contact_rebound(
     user_id = user["sub"]
     contact_data = {
                 **payload.contact.model_dump(),
-                "contact_id": user_id,
-                "server_id": settings.server_id,
+                "contact_id": user_id
             }
         
     pipe = redis.pipeline()
@@ -275,8 +278,7 @@ async def drop_contact(
 
     contact_data = {
         **payload.contact.model_dump(),
-        "contact_id": sender_id,
-        "server_id": settings.server_id,
+        "contact_id": sender_id
     }
 
     inbox_key = _inbox_key(payload.recipient_id)
@@ -326,7 +328,8 @@ class DHDrop(BaseModel):
             "Seconds until an unclaimed dh drop is garbage collected "
             "(max 48 hours). Claiming it via check_dh_drops always clears early."
         ),
-    )
+    ),
+    servers: List[ServerClass]
 
 @router.post("/dh-drop")
 async def dh_drop(
@@ -353,7 +356,7 @@ async def dh_drop(
         "sender_id": sender_id,
         "dh_enc_key": dhd.dh_enc_key,
         "dh_enc_nonce": dhd.dh_enc_nonce,
-        "server_id": settings.server_id,
+        "servers": dhd.servers,
     }
 
     inbox_key = _dh_inbox_key(dhd.recipient_id)

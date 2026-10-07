@@ -12,7 +12,7 @@ from app.utils._redis import get_redis_client
 from app.utils.limiter import is_allowed, get_client_ip
 from app.utils.logger import LoggedAPIRouterMixin
 from app.models.server import Server, ServerIn  # ServerIn needs a new `email: EmailStr` field
-
+from app.routes.connections import ServerClass
 
 class LoggedAPIRouter(LoggedAPIRouterMixin, APIRouter):
     pass
@@ -33,16 +33,42 @@ PHONE_INDEX_KEY = "servers:phone_hash"   # hash: phone_hash -> server_id (duplic
 # Storage helpers (saved list lives in Redis, not a JSON file)
 # ============================================================
 
-async def load_servers(redis: Redis) -> list[dict]:
-    raw = await redis.hgetall(SERVERS_KEY)
-    servers = []
-    for v in raw.values():
-        try:
-            servers.append(json.loads(_as_str(v)))
-        except (json.JSONDecodeError, TypeError):
-            continue  # skip corrupt entries rather than failing the whole list
-    return servers
+# async def load_servers(redis: Redis) -> list[dict]:
+#     raw = await redis.hgetall(SERVERS_KEY)
+#     servers = []
+#     for v in raw.values():
+#         try:
+#             servers.append(json.loads(_as_str(v)))
+#         except (json.JSONDecodeError, TypeError):
+#             continue  # skip corrupt entries rather than failing the whole list
+#     return servers
 
+def load_servers()->list[dict]:
+    # This is temporary, until we have a proper database
+    _l = [{
+  "serverId": "K4m_lsBLJIkT",
+  "serverUrl": "http://127.0.0.1:5000",
+  "serverName": "Test Server",
+  "media": {
+    "url": "https://example.com/image.jpg",
+    "size": 1024,
+    "timer": 10,
+    "media_type": [
+      "image"
+    ]
+  },
+  "maxPayload": 1000,
+  "colour": "#FFFFFF",
+  "about": "This is a test server... Rules are that you should not add rubbish on this server",
+  "categories": [
+    "history", "activism", "community", "social"
+  ],
+  "annotated": False,
+  "disabled": False,
+  "location": None,
+  "serverType": "public"
+}]
+    return _l
 
 async def get_server(redis: Redis, server_id: str) -> Optional[dict]:
     raw = await redis.hget(SERVERS_KEY, server_id)
@@ -143,7 +169,7 @@ async def get_servers(
 ):
     # `Server` is the output model, so owner fields (phone/email hashes etc.) are dropped automatically.
     servers = []
-    for record in await load_servers(redis):
+    for record in load_servers():   # replace later with "await load_servers(redis)"
         try:
             servers.append(Server(**record))
         except ValidationError:
