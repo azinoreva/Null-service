@@ -3,10 +3,20 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 import secrets, string, json
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.utils.auth import require_jwe_auth
 from app.utils.config import settings
 from app.utils._redis import get_redis_client
+from app.utils.db import get_db
 from app.utils.logger import LoggedAPIRouterMixin
+from app.models.connections import (
+    save_contact_drop,
+    pop_contact_drops,
+    save_dh_drop,
+    pop_dh_drops,
+    clear_dh_drops,
+)
 from redis.asyncio import Redis
 
 
@@ -241,26 +251,11 @@ class DropContactRequest(BaseModel):
     )
 
 
-# ---- Redis key helper for inbox ----------------------------------------------
-def _inbox_key(recipient_id: str) -> str: return f"contact:inbox:{recipient_id}"
-
-
-# ---- Atomic fetch-and-clear of the whole inbox hash --------------------------
-FETCH_INBOX_SCRIPT = """
-local vals = redis.call('HGETALL', KEYS[1])
-if #vals == 0 then
-    return nil
-end
-redis.call('DEL', KEYS[1])
-return vals
-"""
-
-
 @router.post("/drop_contact")
 async def drop_contact(
     payload: DropContactRequest,
     user: dict = Depends(require_jwe_auth),
-    redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db),
 ):
     """Drop a contact directly into another user's inbox.
 
@@ -281,11 +276,7 @@ async def drop_contact(
         "contact_id": sender_id
     }
 
-    inbox_key = _inbox_key(payload.recipient_id)
-    pipe = redis.pipeline()
-    pipe.hset(inbox_key, sender_id, json.dumps(contact_data))
-    pipe.expire(inbox_key, payload.expires_in)
-    await pipe.execute()
+    await save_contact_drop(db, payload.recipient_id, contact_data, payload.expires_in)
 
     return {"message": "Contact dropped successfully"}
 
@@ -293,27 +284,17 @@ async def drop_contact(
 @router.post("/check_contact")
 async def check_contact(
     user: dict = Depends(require_jwe_auth),
-    redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db),
 ):
     """Check the caller's inbox for any contacts left for them.
 
     If anything is found, it's returned and the inbox is cleared in the
-    same atomic step (so a contact is delivered exactly once).
+    same step (so a contact is delivered exactly once).
     """
     recipient_id = user["sub"]
 
-    raw = await redis.eval(FETCH_INBOX_SCRIPT, 1, _inbox_key(recipient_id))
-
-    if not raw:
-        return {"contacts": []}
-
-    # raw is a flat [sender_id, json_value, sender_id, json_value, ...] list.
-    contacts = [json.loads(raw[i + 1]) for i in range(0, len(raw), 2)]
+    contacts = await pop_contact_drops(db, recipient_id)
     return {"contacts": contacts}
-
-
-def _dh_inbox_key(user_id: str) -> str:
-    return f"dh_inbox:{user_id}"
 
 
 class DHDrop(BaseModel):
@@ -335,7 +316,7 @@ class DHDrop(BaseModel):
 async def dh_drop(
     dhd: DHDrop,
     user: dict = Depends(require_jwe_auth),
-    redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db),
 ):
     """Drop a dh key for a recipient.
 
@@ -353,17 +334,12 @@ async def dh_drop(
         )
 
     dh_data = {
-        "sender_id": sender_id,
         "dh_enc_key": dhd.dh_enc_key,
         "dh_enc_nonce": dhd.dh_enc_nonce,
-        "servers": dhd.servers,
+        "servers": [s.model_dump() for s in dhd.servers],
     }
 
-    inbox_key = _dh_inbox_key(dhd.recipient_id)
-    pipe = redis.pipeline()
-    pipe.hset(inbox_key, sender_id, json.dumps(dh_data))
-    pipe.expire(inbox_key, dhd.expires_in)
-    await pipe.execute()
+    await save_dh_drop(db, dhd.recipient_id, sender_id, dh_data, dhd.expires_in)
 
     return {"message": "DH key dropped successfully", "expires_in": dhd.expires_in}
 
@@ -371,7 +347,7 @@ async def dh_drop(
 @router.post("/clear_dh_inbox")
 async def clear_dh_inbox(
     user: dict = Depends(require_jwe_auth),
-    redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db),
 ):
     """Wipe the caller's dh inbox without fetching its contents.
 
@@ -379,28 +355,23 @@ async def clear_dh_inbox(
     check_dh_drops (e.g. the client wants a clean slate).
     """
     recipient_id = user["sub"]
-    deleted = await redis.delete(_dh_inbox_key(recipient_id))
+    cleared = await clear_dh_drops(db, recipient_id)
 
-    return {"cleared": bool(deleted)}
+    return {"cleared": cleared}
 
 
 
 @router.post("/check_dh_drops")
 async def check_dh_drops(
     user: dict = Depends(require_jwe_auth),
-    redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db),
 ):
     """Check the caller's inbox for any dh keys left for them.
 
-    Uses the same atomic fetch-and-clear script as check_contact, so a
-    dh key is delivered exactly once.
+    Fetches and clears the inbox in the same step, so a dh key is
+    delivered exactly once.
     """
     recipient_id = user["sub"]
 
-    raw = await redis.eval(FETCH_INBOX_SCRIPT, 1, _dh_inbox_key(recipient_id))
-
-    if not raw:
-        return {"dh_drops": []}
-
-    dh_drops = [json.loads(raw[i + 1]) for i in range(0, len(raw), 2)]
+    dh_drops = await pop_dh_drops(db, recipient_id)
     return {"dh_drops": dh_drops}

@@ -10,10 +10,34 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.utils._redis import init_redis_client, close_redis_client, get_redis_client
+from app.utils.db import AsyncSessionLocal, init_db
+from app.models.connections import purge_expired_drops
 from app.utils.limiter import Limiter
 from app.utils.logger import log_event, logger, request_id_context, safe_exception
 from app.rules import rules
 from app.routers import api_router
+
+
+DROP_CLEANUP_INTERVAL_SECONDS = 300
+
+
+async def _drop_cleanup_loop() -> None:
+    """Periodically delete expired contact/dh drops.
+
+    Reads already filter on expiry, so this only reclaims rows that would
+    otherwise sit forever in inboxes nobody ever fetches.
+    """
+    while True:
+        try:
+            async with AsyncSessionLocal() as db:
+                removed = await purge_expired_drops(db)
+            if removed:
+                logger.info("Purged %s expired contact/dh drop(s)", removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Drop cleanup failed: %s", safe_exception(exc))
+        await asyncio.sleep(DROP_CLEANUP_INTERVAL_SECONDS)
 
 
 class CustomTimeoutException(Exception):
@@ -215,12 +239,21 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup_event():
+        await init_db()
         await init_redis_client()
         app.state.redis = get_redis_client()
-        logger.info("Redis client initialized and app started")
+        app.state.drop_cleanup_task = asyncio.create_task(_drop_cleanup_loop())
+        logger.info("Database tables ensured, Redis client initialized and app started")
 
     @app.on_event("shutdown")
     async def shutdown_event():
+        cleanup_task = getattr(app.state, "drop_cleanup_task", None)
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
         await close_redis_client()
         logger.info("Redis client closed and app stopped")
 

@@ -1,11 +1,16 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from app.routes.signup import router as signup_router
 from app.routes.login import router as login_router
 from app.routes.account import router as account_router
 from app.routes.connections import router as connections_router
 from app.routes.servers import router as servers_router
+from app.utils.db import get_db
 
-api_router = APIRouter(prefix="/api", tags=["api"])
+api_router = APIRouter(
+	prefix="/api",
+	tags=["api"],
+	dependencies=[Depends(get_db)],
+)
 
 
 # Include sub-routers

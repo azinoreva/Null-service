@@ -1,11 +1,16 @@
 from pydantic import BaseModel, Field
 from typing import Optional
 import re
+import time
 from enum import Enum
+from sqlalchemy import Column, Integer, String, JSON, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.utils.db import Base
 
 class Recovery(str, Enum):
     STANDARD="standard"
     SECURE= "Secure"
+
 
 class UserStart(BaseModel):
     phone: str = Field(..., max_length=16, re=r'^\d{11}$')
@@ -47,7 +52,103 @@ class UserAccountCreate:
 class RecoveryPolicy(str, Enum):
     STANDARD = "standard"
     LOCKDOWN = "lockdown"
+
+
 # This information must sit in database.
+class UserORM(Base):
+    __tablename__ = "users"
+
+    _id = Column(String, primary_key=True, index=True)
+    phone_number = Column(String, unique=True, index=True, nullable=True)
+    salt = Column(String, nullable=False)
+    password = Column(String, nullable=False)  # hashed password
+    recovery_type = Column(String, nullable=False, default=RecoveryPolicy.STANDARD.value)
+    push_notification_token = Column(JSON, nullable=True)  # list of tokens
+    date_created = Column(Integer, nullable=False, default=lambda: int(time.time()))
+    settings_blob = Column(String, nullable=True)
+    encrypted_blob = Column(String, nullable=True)  # one-time recovery blob
+    schema_version = Column(Integer, nullable=False, default=1)
+
+    def to_doc(self) -> dict:
+        """Shape the row exactly like the JSON doc the routes already consume."""
+        return {
+            "_id": self._id,
+            "phone_number": self.phone_number,
+            "salt": self.salt,
+            "password": self.password,
+            "recovery_type": self.recovery_type,
+            "push_notification_token": list(self.push_notification_token or []),
+            "date_created": self.date_created,
+            "settings_blob": self.settings_blob,
+            "encrypted_blob": self.encrypted_blob,
+            "schema_version": self.schema_version,
+        }
+
+
+def _doc_id(doc: dict) -> Optional[str]:
+    return doc.get("_id") or doc.get("id") or doc.get("user_id")
+
+
+def _enum_value(value) -> Optional[str]:
+    if isinstance(value, Enum):
+        return value.value
+    return value
+
+
+async def get_user(db: AsyncSession, user_id: str) -> Optional[dict]:
+    row = await db.get(UserORM, user_id)
+    return row.to_doc() if row else None
+
+
+async def get_user_by_phone(db: AsyncSession, phone_number: str) -> Optional[dict]:
+    row = await db.scalar(
+        select(UserORM).where(UserORM.phone_number == phone_number)
+    )
+    return row.to_doc() if row else None
+
+
+async def phone_exists(db: AsyncSession, phone_number: str) -> bool:
+    row = await db.scalar(
+        select(UserORM._id).where(UserORM.phone_number == phone_number)
+    )
+    return row is not None
+
+
+async def save_user(db: AsyncSession, doc: dict) -> str:
+    """Insert or update a user document. Fields absent from `doc` keep
+    their current (or default) value so partial updates are safe."""
+    user_id = _doc_id(doc)
+    if not user_id:
+        raise ValueError("user document has no id")
+
+    row = await db.get(UserORM, user_id)
+    if row is None:
+        row = UserORM(_id=user_id, date_created=int(time.time()))
+        db.add(row)
+
+    if "phone_number" in doc:
+        row.phone_number = doc["phone_number"]
+    if "password" in doc or "password_hash" in doc:
+        row.password = doc.get("password") or doc.get("password_hash")
+    if "salt" in doc:
+        row.salt = doc["salt"]
+    if "recovery_type" in doc:
+        row.recovery_type = _enum_value(doc["recovery_type"]) or RecoveryPolicy.STANDARD.value
+    if "push_notification_token" in doc:
+        tokens = doc["push_notification_token"]
+        row.push_notification_token = list(tokens) if tokens else []
+    if "date_created" in doc and doc["date_created"] is not None:
+        row.date_created = int(doc["date_created"])
+    if "settings_blob" in doc:
+        row.settings_blob = doc["settings_blob"]
+    if "encrypted_blob" in doc:
+        row.encrypted_blob = doc["encrypted_blob"]
+    if "schema_version" in doc and doc["schema_version"] is not None:
+        row.schema_version = int(doc["schema_version"])
+
+    await db.commit()
+    return user_id
+
 class UserAccount(BaseModel):
     id: str = Field(..., max_length=50, alias="_id")
     phone_number: Optional[str] = Field(None)

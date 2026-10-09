@@ -1,7 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.utils.logger import LoggedAPIRouterMixin
-from app.models.user_model import ReturnUserCreate, ForgotPassword
+from app.models.user_model import (
+    ReturnUserCreate, ForgotPassword,
+    get_user, get_user_by_phone, phone_exists, save_user,
+)
 from app.utils._redis import get_redis_client
+from app.utils.db import get_db
 from redis.asyncio import Redis
 from app.utils.auth import create_passport, require_jwe_auth, create_encrypted_token, verify_refresh_token, rotate_refresh_token, verify_password, build_user_details, normalize_phone_number, hash_password
 from pydantic import BaseModel, Field
@@ -50,7 +55,7 @@ class UserDetailsRequest(BaseModel):
 async def get_details(
     payload: UserDetailsRequest,
     user: dict = Depends(require_jwe_auth),
-    redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db),
 ):
     """Hand back everything signup gave, to a user who already has an account.
     Signing in from a second app returns only tokens, so that app never
@@ -60,11 +65,9 @@ async def get_details(
     returns the exact same document /create-new-user-postprocess does.
     """
     user_id = user.get("sub")
-    raw_doc = await redis.hget("users", user_id)
-    if not raw_doc:
+    user_doc = await get_user(db, user_id)
+    if not user_doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
-
-    user_doc = json.loads(raw_doc)
 
     if not verify_password(payload.password, user_doc["salt"], user_doc["password"]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
@@ -86,28 +89,28 @@ async def get_details(
 @router.post("/forgot_password")
 async def forgot_password(
     user: ForgotPassword,
-    redis: Redis = Depends(get_redis_client)
+    redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db)
     ):
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     if user.user_id:
-    # check for user_id in redis
+    # check for user_id in the database
     
-        raw_doc = await redis.hget("users", user.user_id)
-        if not raw_doc:
+        user_doc = await get_user(db, user.user_id)
+        if not user_doc:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     
-        user_doc = json.loads(raw_doc)
         # Now send the users encrypted blob so they figure out themselves
         document = user_doc.get("encrypted_blob")
         return {"message": document}
     elif user.phone_number and not user.pin: 
-        # This means it is the first time so Check for phone in redis
+        # This means it is the first time so Check for phone in the database
         phone_number = normalize_phone_number(user.phone_number)
         if not await exponential_backoff(redis, phone_number):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Too many requests")
         
-        if await redis.hexists("phone_numbers", phone_number):
+        if await phone_exists(db, phone_number):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="if this phone number is registered, an sms will be sent to you")
         # Make otp and send it
         otp = random.randint(100000, 999999)
@@ -127,9 +130,9 @@ async def forgot_password(
         if str(otp) != user.pin:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
         # Find the user_id from phone
-        user_id = await redis.hget("phone_numbers", phone_number)
-        raw_doc = await redis.hget("users", user_id)
-        user_doc = json.loads(raw_doc)
+        user_doc = await get_user_by_phone(db, phone_number)
+        if not user_doc:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
         # Now send the users encrypted blob so they figure out themselves
         document = user_doc.get("encrypted_blob")
         return {"message": document}
@@ -178,43 +181,42 @@ class PasswordChangeResponse(BaseModel):
 async def change_password(
     request: PasswordChangeRequest,
     user: dict = Depends(require_jwe_auth),
-    redis: Redis = Depends(get_redis_client)
+    db: AsyncSession = Depends(get_db)
 ):
     if request.current_password == request.new_password:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="New password must be different from current password"
         )
-    # Check the user_id in the redis hash to ensure the user exists and is authenticated
+    # Check the user_id in the database to ensure the user exists and is authenticated
     user_id = user.get("sub")
-    _user = await redis.hget("users", user_id)
-    if not _user:
+    _user_ = await get_user(db, user_id)
+    if not _user_:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
-    _user_ = json.loads(_user)
-    if not _user_.get("salt") or not _user_.get("password_hash"):
+    if not _user_.get("salt") or not _user_.get("password"):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not authenticated !"
         )
-    verified = await verify_password(request.current_password, _user_.get("salt"), _user_.get("password_hash"))
+    verified = verify_password(request.current_password, _user_.get("salt"), _user_.get("password"))
     if not verified:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid current password"
         )
     
-    # Step 1: Update the password in Redis
-    new_password_hash, new_salt = await hash_password(request.new_password)
+    # Step 1: Update the password in the database
+    new_salt, new_password_hash = hash_password(request.new_password)
     # edit user
-    _user_["password_hash"] = new_password_hash
+    _user_["password"] = new_password_hash
     _user_["salt"] = new_salt
     # save the encrypted blob
     _user_["encrypted_blob"] = request.encrypted_blob
 
-    await redis.hset("users", user_id, json.dumps(_user_))
+    await save_user(db, _user_)
     
     # Step 2: Generate a new encrypted token
     new_token_data = await create_encrypted_token(request.new_password, _user_)
@@ -229,7 +231,7 @@ class PushToken(BaseModel):
 async def set_push_notification_token(
     token: PushToken,
     user: dict = Depends(require_jwe_auth),
-    redis: Redis = Depends(get_redis_client)
+    db: AsyncSession = Depends(get_db)
 ):
     
     user_id = user.get("sub")
@@ -239,40 +241,33 @@ async def set_push_notification_token(
             detail="Invalid user"
         )
         
-    # 1. Fetch user data from Redis
-    user_data_str = await redis.hget("users", user_id)
-    if not user_data_str:
+    # 1. Fetch user data from the database
+    user_data = await get_user(db, user_id)
+    if not user_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
-        
-    # 2. Safely parse the existing user JSON document
-    try:
-        user_data = json.loads(user_data_str)
-    except json.JSONDecodeError:
-    # Fallback if the data in Redis happens to be malformed
-        user_data = {}
 
-    # 3. Ensure the tokens field exists and is a list
+    # 2. Ensure the tokens field exists and is a list
     current_tokens = user_data.get("push_notification_token")
     
     if isinstance(current_tokens, list):
         # Prevent adding duplicate tokens to the list
-        if token not in current_tokens:
+        if token.token not in current_tokens:
             current_tokens.append(token.token)
     elif isinstance(current_tokens, str) and current_tokens:
         # If it was previously saved as a single string, convert it to a list
         if current_tokens == token.token:
             user_data["push_notification_token"] = [token.token]
         else:
-            user_data["push_notification_token"] = [current_tokens, token]
+            user_data["push_notification_token"] = [current_tokens, token.token]
     else:
         # Initialize a new list if the field was missing or null
         user_data["push_notification_token"] = [token.token]
 
-    # 4. Save the merged object back to the Redis hash
-    await redis.hset("users", user_id, json.dumps(user_data))
+    # 3. Save the merged object back to the database
+    await save_user(db, user_data)
     
     return {
         "status": "success",
@@ -294,11 +289,11 @@ class SentTo(BaseModel):
 async def send_push_notification(
     sent_to: SentTo,
     user: dict = Depends(require_jwe_auth),
-    redis: Redis = Depends(get_redis_client)
+    db: AsyncSession = Depends(get_db)
 ):
     
     # check the user_id if it exists. 
-    recipient = await redis.hget("users", sent_to.user_id)
+    recipient = await get_user(db, sent_to.user_id)
     if not recipient:
         # log the unusual use case
         #logger.warning("Attempt to send notification to non-existent user_id: %s", sent_to
@@ -312,7 +307,7 @@ async def send_push_notification(
             detail="Cannot send notification to yourself"
         )
 
-    notification_tokens = json.loads(recipient).get("push_notification_token", [])
+    notification_tokens = recipient.get("push_notification_token", [])
     if sent_to.notification_type == NotificationType.PING:
         message = "Ping from user {}".format(user.get("sub"))
         for token in notification_tokens:
@@ -385,7 +380,8 @@ def hash_otp(otp: str):
 async def edit_my_phone_number(
     payload: PhoneNumber,
     user: dict = Depends(require_jwe_auth),
-    redis = Depends(get_redis_client)
+    redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db)
 ):
     user_id = user.get("sub")
 
@@ -397,24 +393,12 @@ async def edit_my_phone_number(
 
 
     # Get user
-    user_data_str = await redis.hget(
-        "users",
-        user_id
-    )
+    user_data = await get_user(db, user_id)
 
-    if not user_data_str:
+    if not user_data:
         raise HTTPException(
             status_code=404,
             detail="User not found"
-        )
-
-
-    try:
-        user_data = json.loads(user_data_str)
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=500,
-            detail="Corrupt user data"
         )
 
 
@@ -461,13 +445,13 @@ async def edit_my_phone_number(
 
 
             # check duplicate
-            existing_user = await redis.hget(
-                "phone_numbers",
+            existing_user = await get_user_by_phone(
+                db,
                 new_phone
             )
 
 
-            if existing_user and existing_user != user_id:
+            if existing_user and existing_user["_id"] != user_id:
                 raise HTTPException(
                     status_code=400,
                     detail="Phone number already registered"
@@ -555,16 +539,8 @@ async def edit_my_phone_number(
         #
         if action == PhoneAction.REMOVE.value:
 
-            if current_phone:
-                await redis.hdel(
-                    "phone_numbers",
-                    current_phone
-                )
-
-            user_data.pop(
-                "phone_number",
-                None
-            )
+            # The phone column doubles as the index; clearing it removes the lookup.
+            user_data["phone_number"] = None
 
 
         #
@@ -575,30 +551,19 @@ async def edit_my_phone_number(
             new_phone = pending["new_phone_number"]
 
 
-            # remove old index
-            if current_phone:
-                await redis.hdel(
-                    "phone_numbers",
-                    current_phone
+            # re-check duplicate in case someone claimed it while the OTP was pending
+            existing_user = await get_user_by_phone(db, new_phone)
+            if existing_user and existing_user["_id"] != user_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Phone number already registered"
                 )
 
 
             user_data["phone_number"] = new_phone
 
 
-            # create new index
-            await redis.hset(
-                "phone_numbers",
-                new_phone,
-                user_id
-            )
-
-
-        await redis.hset(
-            "users",
-            user_id,
-            json.dumps(user_data)
-        )
+        await save_user(db, user_data)
 
 
         await redis.delete(

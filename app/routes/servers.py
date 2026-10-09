@@ -1,17 +1,31 @@
 from __future__ import annotations
 
-import secrets, json, nanoid, hmac, hashlib, colorsys
+import secrets, nanoid, hmac, hashlib, colorsys
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field, ValidationError
 from redis.asyncio import Redis
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.utils.auth import require_jwe_auth
 from app.utils.config import settings
 from app.utils._redis import get_redis_client
+from app.utils.db import get_db
 from app.utils.limiter import is_allowed, get_client_ip
 from app.utils.logger import LoggedAPIRouterMixin
-from app.models.server import Server, ServerIn  # ServerIn needs a new `email: EmailStr` field
+from app.models.server import (
+    Server,
+    ServerIn,
+    list_servers,
+    create_server,
+    save_server,
+    save_owner,
+    phone_registered,
+    get_owned_server,
+    add_user_servers,
+    list_user_servers,
+)
 from app.routes.connections import ServerClass
 
 class LoggedAPIRouter(LoggedAPIRouterMixin, APIRouter):
@@ -24,63 +38,9 @@ OTP_TTL = 300  # 5 minutes
 MAX_OTP_ATTEMPTS = 2
 SERVER_ID_LEN = 12
 
-# Redis keys for the saved list of servers
-SERVERS_KEY = "servers"                  # hash: server_id -> JSON record
-PHONE_INDEX_KEY = "servers:phone_hash"   # hash: phone_hash -> server_id (duplicate guard)
-
 
 # ============================================================
-# Storage helpers (saved list lives in Redis, not a JSON file)
-# ============================================================
-
-# async def load_servers(redis: Redis) -> list[dict]:
-#     raw = await redis.hgetall(SERVERS_KEY)
-#     servers = []
-#     for v in raw.values():
-#         try:
-#             servers.append(json.loads(_as_str(v)))
-#         except (json.JSONDecodeError, TypeError):
-#             continue  # skip corrupt entries rather than failing the whole list
-#     return servers
-
-def load_servers()->list[dict]:
-    # This is temporary, until we have a proper database
-    _l = [{
-  "serverId": "K4m_lsBLJIkT",
-  "serverUrl": "http://127.0.0.1:5000",
-  "serverName": "Test Server",
-  "media": {
-    "url": "https://example.com/image.jpg",
-    "size": 1024,
-    "timer": 10,
-    "media_type": [
-      "image"
-    ]
-  },
-  "maxPayload": 1000,
-  "colour": "#FFFFFF",
-  "about": "This is a test server... Rules are that you should not add rubbish on this server",
-  "categories": [
-    "history", "activism", "community", "social"
-  ],
-  "annotated": False,
-  "disabled": False,
-  "location": None,
-  "serverType": "public"
-}]
-    return _l
-
-async def get_server(redis: Redis, server_id: str) -> Optional[dict]:
-    raw = await redis.hget(SERVERS_KEY, server_id)
-    return json.loads(_as_str(raw)) if raw else None
-
-
-async def save_server(redis: Redis, server: dict) -> None:
-    await redis.hset(SERVERS_KEY, server["serverId"], json.dumps(server))
-
-
-# ============================================================
-# Hashing / cleaning helpers
+# Storage helpers (saved list lives in the database)
 # ============================================================
 
 def _as_str(v) -> Optional[str]:
@@ -165,11 +125,11 @@ class ServerList(BaseModel):
 @router.get("/servers", response_model=ServerList)
 async def get_servers(
     user: dict = Depends(require_jwe_auth),
-    redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db),
 ):
     # `Server` is the output model, so owner fields (phone/email hashes etc.) are dropped automatically.
     servers = []
-    for record in load_servers():   # replace later with "await load_servers(redis)"
+    for record in await list_servers(db):
         try:
             servers.append(Server(**record))
         except ValidationError:
@@ -217,6 +177,7 @@ async def register_server_pre(
 async def register_server_post(
     server_owner: ServerIn,
     redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db),
 ):
     phone = clean_phone(server_owner.phone)
 
@@ -225,28 +186,47 @@ async def register_server_post(
     phone_hash = hash_phone(phone)
     email_hash = hash_email(server_owner.email)
 
-    # Reserve the phone first so the same phone can't register twice.
-    server_id = nanoid.generate(size=SERVER_ID_LEN)
-    if not await redis.hsetnx(PHONE_INDEX_KEY, phone_hash, server_id):
+    # A phone can own at most one server. The unique index on phone_hash is
+    # the real guard; this check just gives a clean 409 without an insert.
+    if await phone_registered(db, phone_hash):
         raise HTTPException(status_code=409, detail="Server already exists for this phone")
 
-    record = server_owner.model_dump(exclude={"otp", "phone", "email"}, mode="json")
-    record["serverId"] = server_id
-    record["phone_hash"] = phone_hash
-    record["email_hash"] = email_hash  # used to authorise later media-url changes
-    record["ephemeral"] = server_owner.ephemeral
+    # Public server fields (owner identity is stripped out and stored separately).
+    base = server_owner.model_dump(
+        mode="json", exclude={"otp", "phone", "email", "ephemeral"}
+    )
+    base.pop("server_url", None)
 
-    if not server_owner.ephemeral:
-        record["phone"] = phone
-        record["email"] = server_owner.email
+    owner = {
+        "server_id": None,  # filled below once the id is settled
+        "phone_hash": phone_hash,
+        "email_hash": email_hash,
+        "phone": None if server_owner.ephemeral else phone,
+        "email": None if server_owner.ephemeral else str(server_owner.email),
+        "ephemeral": server_owner.ephemeral,
+    }
 
-    # HSETNX guards against an ID collision; regenerate if it happens.
-    record["colour"] = generate_colour(server_id)  # server-assigned, derived from the ID
-    while not await redis.hsetnx(SERVERS_KEY, server_id, json.dumps(record)):
-        server_id = nanoid.generate(size=SERVER_ID_LEN)
-        record["serverId"] = server_id
-        record["colour"] = generate_colour(server_id)
-    await redis.hset(PHONE_INDEX_KEY, phone_hash, server_id)
+    # A server id collision (or a race on the phone index) surfaces as an
+    # IntegrityError; regenerate the id and retry, or 409 if the phone raced.
+    server_id = nanoid.generate(size=SERVER_ID_LEN)
+    for _ in range(10):
+        record = {
+            **base,
+            "serverId": server_id,
+            "serverUrl": server_owner.server_url,
+            "colour": generate_colour(server_id),
+        }
+        owner["server_id"] = server_id
+        try:
+            await create_server(db, record, owner)
+            break
+        except IntegrityError:
+            await db.rollback()
+            if await phone_registered(db, phone_hash):
+                raise HTTPException(status_code=409, detail="Server already exists for this phone")
+            server_id = nanoid.generate(size=SERVER_ID_LEN)
+    else:
+        raise HTTPException(status_code=500, detail="Could not allocate a server id")
 
     return {"message": "Server registered", "server_id": server_id}
 
@@ -267,12 +247,12 @@ class MediaUrlUpdate(BaseModel):
     server_url: Optional[str] = Field(None, max_length=150)
 
 
-async def _get_owned_server(redis: Redis, server_id: str, email: str) -> dict:
-    server = await get_server(redis, server_id)
-    if server and hmac.compare_digest(server.get("email_hash", ""), hash_email(email)):
-        return server
-    # Same error for "not found" and "wrong email" so IDs/emails can't be probed.
-    raise HTTPException(status_code=404, detail="Server not found for this email")
+async def _get_owned_server(db: AsyncSession, server_id: str, email: str) -> tuple[dict, dict]:
+    owned = await get_owned_server(db, server_id, hash_email(email))
+    if owned is None:
+        # Same error for "not found" and "wrong email" so IDs/emails can't be probed.
+        raise HTTPException(status_code=404, detail="Server not found for this email")
+    return owned
 
 
 @router.post("/servers/{server_id}/media-url/otp")
@@ -281,12 +261,13 @@ async def request_media_url_otp(
     body: MediaUrlOtpRequest,
     request: Request,
     redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db),
 ):
     ip = get_client_ip(request)
     if not await is_allowed(redis, server_id, ip):
         raise HTTPException(status_code=403, detail="Not allowed")
 
-    await _get_owned_server(redis, server_id, body.email)
+    await _get_owned_server(db, server_id, body.email)
 
     otp = generate_otp()
     key = f"otp_media:{server_id}"
@@ -306,8 +287,9 @@ async def update_media_url(
     server_id: str,
     body: MediaUrlUpdate,
     redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db),
 ):
-    server = await _get_owned_server(redis, server_id, body.email)
+    server, owner = await _get_owned_server(db, server_id, body.email)
 
     if body.media_url is None and body.server_url is None and body.new_email is None:
         raise HTTPException(status_code=400, detail="No server settings to update")
@@ -318,20 +300,24 @@ async def update_media_url(
     await verify_otp(redis, f"otp_media:{server_id}", body.otp)
 
     if body.media_url is not None:
-        server["media"]["url"] = body.media_url
+        media = dict(server.get("media") or {})
+        media["url"] = body.media_url
+        server["media"] = media
     if body.server_url is not None:
-        server["server_url"] = body.server_url
+        server["serverUrl"] = body.server_url
     if body.new_email is not None:
-        server["email_hash"] = hash_email(body.new_email)
-        if not server.get("ephemeral"):
-            server["email"] = str(body.new_email)
-    await save_server(redis, server)
+        owner["email_hash"] = hash_email(body.new_email)
+        if not owner.get("ephemeral"):
+            owner["email"] = str(body.new_email)
+
+    await save_server(db, server)
+    await save_owner(db, owner)
 
     return {
         "message": "Server settings updated",
         "serverId": server_id,
         "media_url": server.get("media", {}).get("url"),
-        "server_url": server.get("server_url"),
+        "server_url": server.get("serverUrl"),
         "email": body.new_email,
     }
 

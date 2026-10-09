@@ -1,9 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from app.models.user_model import Recovery, UserAccount, RecoveryPolicy, SignInReturn, ReturnUserCreate
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.models.user_model import (
+    Recovery, UserAccount, RecoveryPolicy, SignInReturn, ReturnUserCreate,
+    phone_exists, save_user,
+)
 from app.utils._redis import get_redis_client
+from app.utils.db import get_db
 from redis.asyncio import Redis
 from app.utils.backoff import backoff
-import random, json
+import random
 from uuid import uuid4
 from app.utils.auth import create_passport, require_jwe_auth, create_encrypted_token, verify_refresh_token, rotate_refresh_token, verify_password, hash_password, build_user_details, normalize_phone_number
 from pydantic import BaseModel, Field
@@ -27,15 +32,16 @@ class UserCreate(BaseModel):
 @router.post("/create-new-user-preprocess")
 async def create_new_user_preprocess(
     user: UserCreate,
-    redis: Redis = Depends(get_redis_client)
+    redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db)
 ):
     """
     This endpoint checks if the phone number already exists and if it does not, it generates a 6 digit pin that expires in 10 minutes
     """
     phone_number = normalize_phone_number(user.phone_number)
 
-    # check if this phone number already exists in the redis members set
-    if await redis.hexists("phone_numbers", phone_number):
+    # check if this phone number already exists in the database
+    if await phone_exists(db, phone_number):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not allowed")
     # Lets do exponential backoff for this using redis so the user does not waste our sms.
     check_phone_block = await exponential_backoff(redis, phone_number)
@@ -68,11 +74,12 @@ class UserCreatePostProcess(UserCreate):
 @router.post("/create-new-user-postprocess", response_model=ReturnUserCreate)
 async def create_new_user_postprocess(
     user: UserCreatePostProcess,
-    redis: Redis = Depends(get_redis_client)
+    redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db)
 ):
     phone_number = normalize_phone_number(user.phone_number)
 
-    if await redis.hexists("phone_numbers", phone_number):
+    if await phone_exists(db, phone_number):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not allowed")
 
     # check_phone_block = await backoff(redis, phone_number)
@@ -102,13 +109,13 @@ async def create_new_user_postprocess(
         schema_version=1,
         encrypted_blob=user.encrypted_blob if user.encrypted_blob else None # This encrypted blob is the users encrypted password.
     )
-    json_doc = json.dumps(account.model_dump())
+    user_doc = account.model_dump(mode="json", by_alias=True)
 
-    pipeline = redis.pipeline()
-    pipeline.hset("users", user_id, json_doc)
-    pipeline.hset("phone_numbers", phone_number, user_id)
-    pipeline.delete(f"otp_:{phone_number}")
-    await pipeline.execute()
+    # Persist the user to the database (SQLite by default, Postgres via DATABASE_URL)
+    await save_user(db, user_doc)
+
+    # OTP is ephemeral - it lives in Redis with a TTL
+    await redis.delete(f"otp_{phone_number}")
 
   
 
@@ -119,7 +126,7 @@ async def create_new_user_postprocess(
     
     # Sign the user_passport (inside build_user_details)
     return_doc = {
-        **build_user_details(user_id, json.loads(json_doc)),
+        **build_user_details(user_id, user_doc),
         **security_token_doc,
         "passport": create_passport(user_id, user.public_key)
     }
